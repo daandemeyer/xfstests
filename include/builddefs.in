@@ -67,6 +67,7 @@ HAVE_OPEN_BY_HANDLE_AT = @have_open_by_handle_at@
 HAVE_FIEMAP = @have_fiemap@
 HAVE_FALLOCATE = @have_fallocate@
 HAVE_COPY_FILE_RANGE = @have_copy_file_range@
+HAVE_FUSE_PASSTHROUGH = @have_fuse_passthrough@
 HAVE_LIBBTRFSUTIL = @have_libbtrfsutil@
 HAVE_SEEK_DATA = @have_seek_data@
 HAVE_NFTW = @have_nftw@

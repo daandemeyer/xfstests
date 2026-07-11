@@ -102,3 +102,28 @@ AC_DEFUN([AC_HAVE_FILE_GETATTR],
        AC_MSG_RESULT(yes)],[AC_MSG_RESULT(no)])
     AC_SUBST(have_file_getattr)
   ])
+
+# Check if we have the FUSE passthrough UAPI
+AC_DEFUN([AC_HAVE_FUSE_PASSTHROUGH],
+  [ AC_MSG_CHECKING([for FUSE passthrough UAPI])
+    AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <stdint.h>
+#include <sys/ioctl.h>
+#include <linux/fuse.h>
+    ]], [[
+         struct fuse_backing_map map = { .fd = -1 };
+         struct fuse_init_out init = { .max_stack_depth = 1 };
+         struct fuse_open_out open = {
+              .open_flags = FOPEN_PASSTHROUGH,
+              .backing_id = 0,
+         };
+         uint64_t flags = FUSE_INIT_EXT | FUSE_PASSTHROUGH;
+         unsigned long cmd = FUSE_DEV_IOC_BACKING_OPEN;
+
+         return map.fd + init.max_stack_depth + open.open_flags +
+                open.backing_id + flags + cmd;
+    ]])],[have_fuse_passthrough=yes
+       AC_MSG_RESULT(yes)],[have_fuse_passthrough=no
+       AC_MSG_RESULT(no)])
+    AC_SUBST(have_fuse_passthrough)
+  ])

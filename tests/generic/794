@@ -1,0 +1,213 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Daan De Meyer. All Rights Reserved.
+#
+# FS QA Test 794
+#
+# Verify copy_file_range() between FUSE passthrough files and their backing
+# files, including nested overlayfs, terminal splice, and rejection paths.
+#
+. ./common/preamble
+_begin_fstest auto quick copy_range
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	[ -n "$fuse_mnt" ] && $UMOUNT_PROG $fuse_mnt 2>/dev/null
+	[ -n "$daemon_pid" ] && kill $daemon_pid 2>/dev/null
+	[ -n "$daemon_pid" ] && wait $daemon_pid 2>/dev/null
+	_clear_mount_stack
+	rm -rf $tmp.*
+}
+
+. ./common/reflink
+
+_require_scratch_reflink
+_require_arbitrary_fileset_reflink
+_require_test_program "fuse_passthrough"
+_require_xfs_io_command "copy_range"
+_require_extra_fs tmpfs
+_require_extra_fs overlay
+_require_extra_fs fuse
+_require_local_device /dev/fuse
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+blksz=$(_get_file_block_size $SCRATCH_MNT)
+size=$((2 * blksz))
+
+# Backing files for the FUSE server and the plain source, on the scratch fs.
+fuse_src=$SCRATCH_MNT/fuse-src
+fuse_dst1=$SCRATCH_MNT/fuse-dst1
+plain_src=$SCRATCH_MNT/plain-src
+out_fuse=$SCRATCH_MNT/out-fuse
+$XFS_IO_PROG -f -c "pwrite -q -S 0x61 0 $size" $fuse_src
+$XFS_IO_PROG -f -c "pwrite -q -S 0x62 0 $size" $plain_src
+touch $fuse_dst1 $out_fuse
+
+# A tmpfs mount holds one FUSE backing file and two plain files, all on the
+# same superblock.  It is used both for the cross-filesystem (incompatible)
+# case and for the matching-tmpfs terminal splice cases.
+tmpfs_mnt=$tmp.tmpfs
+mkdir -p $tmpfs_mnt
+_get_mount -t tmpfs tmpfs $tmpfs_mnt || \
+	_notrun "could not mount tmpfs fixture"
+fuse_dst2=$tmpfs_mnt/fuse-dst2
+tmpfs_plain=$tmpfs_mnt/plain-src
+touch $fuse_dst2
+$XFS_IO_PROG -f -c "pwrite -q -S 0x63 0 $size" $tmpfs_plain
+
+# An overlay backed by the same scratch fs, for cross-stack and recursive
+# resolution cases.
+ovl_mnt=$tmp.ovl
+mkdir -p $SCRATCH_MNT/ovl-lower $SCRATCH_MNT/ovl-upper $SCRATCH_MNT/ovl-work \
+	$ovl_mnt
+cp $fuse_src $SCRATCH_MNT/ovl-lower/data
+touch $SCRATCH_MNT/ovl-upper/fuse-out
+if ! _get_mount -t overlay overlay \
+	-o lowerdir=$SCRATCH_MNT/ovl-lower,upperdir=$SCRATCH_MNT/ovl-upper,workdir=$SCRATCH_MNT/ovl-work \
+	$ovl_mnt 2>> $seqres.full; then
+	_notrun "scratch filesystem cannot host the overlay fixture"
+fi
+
+# Launch the FUSE passthrough server and wait for its mount to appear.
+fuse_mnt=$tmp.fuse
+mkdir -p $fuse_mnt
+$here/src/fuse_passthrough $fuse_mnt $fuse_src $fuse_dst1 $fuse_dst2 \
+	$ovl_mnt/data $ovl_mnt/fuse-out \
+	>> $seqres.full 2>&1 &
+daemon_pid=$!
+fuse_mounted=
+for i in $(seq 1 100); do
+	if findmnt -rn -M $fuse_mnt >/dev/null 2>&1; then
+		fuse_mounted=yes
+		break
+	fi
+	if ! kill -0 $daemon_pid 2>/dev/null; then
+		wait $daemon_pid 2>/dev/null
+		daemon_pid=
+		_fail "FUSE passthrough server exited during startup"
+	fi
+	sleep 0.05
+done
+[ -n "$fuse_mounted" ] || _fail "could not mount FUSE passthrough server"
+
+# Opening a passthrough node exercises backing registration and distinguishes
+# a usable /dev/fuse from a kernel without FUSE passthrough support.
+if ! $XFS_IO_PROG -r -c stat $fuse_mnt/src >> $seqres.full 2>&1; then
+	_notrun "kernel does not support FUSE passthrough opens"
+fi
+
+# Copy $size bytes from $1 into $2, printing xfs_io output (empty on success).
+do_copy()
+{
+	$XFS_IO_PROG -c "copy_range -l $size $1" $2 2>&1
+}
+
+# A copy that must succeed; optionally verify the backing files ($4,$5) share.
+check_ok()
+{
+	local name=$1 src=$2 dst=$3 bsrc=$4 bdst=$5 out
+
+	out=$(do_copy $src $dst)
+	[ -z "$out" ] || _fail "$name: copy failed: $out"
+	cmp -s $src $dst || _fail "$name: content mismatch"
+	if [ -n "$bsrc" ]; then
+		_scratch_sync
+		_verify_reflink $bsrc $bdst
+	fi
+}
+
+# A copy that must fail with EXDEV.
+check_exdev()
+{
+	local name=$1 src=$2 dst=$3
+	local opts="${4:--l $size}"
+	local before after out
+
+	before="$(_md5_checksum $dst) $(stat -c '%s %f' $dst)"
+	out=$($XFS_IO_PROG -c "copy_range $opts $src" $dst 2>&1)
+	after="$(_md5_checksum $dst) $(stat -c '%s %f' $dst)"
+	echo "$out" | grep -q "Invalid cross-device link" || \
+		_fail "$name: expected EXDEV, got: ${out:-success}"
+	[ "$before" == "$after" ] || \
+		_fail "$name: destination changed after EXDEV"
+}
+
+# An exact FUSE pair must retain the FUSE method instead of reflinking its
+# backing files through the layer operations table.
+check_not_reflinked()
+{
+	local name=$1 src=$2 dst=$3
+	local verify
+
+	_scratch_sync
+	verify=$(_verify_reflink $src $dst)
+	[ -n "$verify" ] || _fail "$name: backing files were reflinked"
+}
+
+# Probe for kernel support with the first copy; treat EXDEV as unsupported.
+testio=$(do_copy $fuse_mnt/src $out_fuse)
+echo "$testio" | grep -q "cross-device" && \
+	_notrun "kernel does not support FUSE passthrough copy_file_range()"
+[ -z "$testio" ] || _fail "fuse-source-to-backing: copy failed: $testio"
+cmp -s $fuse_mnt/src $out_fuse || \
+	_fail "fuse-source-to-backing: content mismatch"
+_scratch_sync
+_verify_reflink $fuse_src $out_fuse
+
+: > $fuse_dst1
+check_ok "backing-to-fuse-destination" $plain_src $fuse_mnt/dst1 \
+	$plain_src $fuse_dst1
+
+# Two FUSE files of the same server keep using the server's own copy method
+# (the identical-method rule wins before endpoint translation), so the copy
+# succeeds but must NOT reflink the backing files.
+: > $fuse_dst1
+check_ok "fuse-to-fuse-method" $fuse_mnt/src $fuse_mnt/dst1
+check_not_reflinked "fuse-to-fuse-method" $fuse_src $fuse_dst1
+
+# The reverse chain alias must be rejected before destination preparation too.
+$XFS_IO_PROG -f -c "pwrite -q -S 0x64 0 $size" $fuse_dst1
+check_exdev "fuse-destination-backing-alias" $fuse_dst1 $fuse_mnt/dst1 \
+	"-s 0 -d $blksz -l $blksz"
+
+# A plain scratch source into a FUSE file backed by tmpfs is cross-filesystem.
+: > $fuse_dst2
+check_exdev "backing-to-fuse-incompatible-backing" $plain_src $fuse_mnt/dst2
+
+# Matching tmpfs backing on both sides is a compatible same-superblock pair.
+# tmpfs opts into backing copies but has no reflink, so the copy succeeds via
+# the terminal splice path.
+: > $fuse_dst2
+check_ok "plain-tmpfs-to-fuse-tmpfs-splice" $tmpfs_plain $fuse_mnt/dst2
+
+# Two FUSE files of the same server with incompatible backing fall back to the
+# server's copy path (here an in-kernel splice copy), so the copy still works.
+: > $fuse_dst2
+check_ok "fuse-to-fuse-fallback" $fuse_mnt/src $fuse_mnt/dst2
+
+# One-sided nested routes must traverse both FUSE and overlay layers.  These
+# exercise recursive source resolution and recursive destination preparation
+# without relying on a separate recursive opt-in.
+: > $out_fuse
+check_ok "nested-fuse-source-to-backing" $fuse_mnt/ovlsrc $out_fuse \
+	$SCRATCH_MNT/ovl-lower/data $out_fuse
+: > $SCRATCH_MNT/ovl-upper/fuse-out
+check_ok "backing-to-nested-fuse-destination" $plain_src $fuse_mnt/ovldst \
+	$plain_src $SCRATCH_MNT/ovl-upper/fuse-out
+
+# A hidden alias at the end of the two-layer source chain is still unsafe.
+check_exdev "nested-fuse-backing-alias" $fuse_mnt/ovlsrc \
+	$SCRATCH_MNT/ovl-lower/data "-s 0 -d $blksz -l $blksz"
+
+: > $fuse_dst1
+check_ok "overlay-source-to-fuse-destination" $ovl_mnt/data \
+	$fuse_mnt/dst1 $SCRATCH_MNT/ovl-lower/data $fuse_dst1
+
+echo "Silence is golden"
+
+# success, all done
+_exit 0
