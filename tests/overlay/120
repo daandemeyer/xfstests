@@ -1,0 +1,66 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Daan De Meyer. All Rights Reserved.
+#
+# FS QA Test 120
+#
+# Verify that unprivileged translated copies clear setid bits on plain and
+# overlayfs destinations, including the overlay upper inode.
+#
+. ./common/preamble
+_begin_fstest auto quick copy_range perms samefs
+
+_require_user
+_require_chmod
+_require_unix_perm_checking
+_require_scratch
+_require_xfs_io_command "copy_range"
+
+_scratch_mkfs >> $seqres.full 2>&1
+
+basedir=$OVL_BASE_SCRATCH_MNT
+lowerdir=$basedir/$OVL_LOWER
+upperdir=$basedir/$OVL_UPPER
+
+# Fixtures on the base fs, world readable so the unprivileged user can copy.
+$XFS_IO_PROG -f -c "pwrite -q -S 0x61 0 8k" $lowerdir/data
+$XFS_IO_PROG -f -c "pwrite -q -S 0x62 0 8k" $basedir/src
+chmod a+r $lowerdir/data $basedir/src
+
+_scratch_mount
+# Let the unprivileged user traverse to the overlay and base fs fixtures.
+chmod a+rx $SCRATCH_MNT $basedir
+
+# Use an unaligned range so the test does not require base-fs reflink support.
+copy_len=8191
+testio=$($XFS_IO_PROG -f \
+	-c "copy_range -s 1 -d 1 -l $copy_len $SCRATCH_MNT/data" \
+	$basedir/probe 2>&1)
+echo "$testio" | grep -q "cross-device" && \
+	_notrun "kernel does not support copy_file_range() between overlayfs and base fs"
+[ -z "$testio" ] || _fail "copy probe failed: $testio"
+rm -f $basedir/probe
+
+# Run an unprivileged copy into a setid destination and check the result.
+check_copy_as_user()
+{
+	local src=$1 dst=$2 backing_dst=${3:-}
+
+	$XFS_IO_PROG -f -c "pwrite -q -S 0x00 0 8k" $dst
+	chmod 6777 $dst
+	_su - "$qa_user" -c \
+		"$XFS_IO_PROG -f -c 'copy_range -s 1 -d 1 -l $copy_len $src' $dst" \
+		>> $seqres.full 2>&1 || _fail "copy into $dst failed"
+	[ "$(stat -c %a $dst)" = 777 ] || _fail "$dst retained privilege bits"
+	[ -z "$backing_dst" ] || [ "$(stat -c %a $backing_dst)" = 777 ] || \
+		_fail "$backing_dst retained privilege bits"
+	cmp -s -n $copy_len -i 1:1 $src $dst || _fail "$dst data mismatch"
+}
+
+check_copy_as_user $SCRATCH_MNT/data $basedir/setid16
+check_copy_as_user $basedir/src $SCRATCH_MNT/setid17 $upperdir/setid17
+
+echo "Silence is golden"
+
+# success, all done
+_exit 0

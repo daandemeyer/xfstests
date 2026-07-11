@@ -1,0 +1,180 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Daan De Meyer. All Rights Reserved.
+#
+# FS QA Test 118
+#
+# Verify copy_file_range() between overlayfs and its backing filesystem.
+# Cover both endpoint directions, nested overlays, remap and splice paths,
+# and rejection of hidden aliases and incompatible filesystems.
+#
+. ./common/preamble
+_begin_fstest auto quick copy_range atime nested samefs
+
+# Override the default cleanup function.  The nested overlay uses the scratch
+# overlay as its lower layer, so it must be unmounted before the harness
+# unmounts the scratch and base filesystems.
+_cleanup()
+{
+	cd /
+	$UMOUNT_PROG $nested_mnt 2>/dev/null
+	$UMOUNT_PROG $ovl2_mnt 2>/dev/null
+	rm -rf $tmp.*
+}
+
+. ./common/reflink
+
+_require_scratch
+_require_xfs_io_command "copy_range"
+
+_scratch_mkfs >> $seqres.full 2>&1
+
+basedir=$OVL_BASE_SCRATCH_MNT
+lowerdir=$basedir/$OVL_LOWER
+upperdir=$basedir/$OVL_UPPER
+blksz=$(_get_block_size $basedir)
+size=$((2 * blksz))
+copy_len=$((size - 1))
+
+# Use distinct halves so an erroneous copy into the source's own backing file
+# cannot pass as a no-op.
+$XFS_IO_PROG -f -c "pwrite -q -S 0x61 0 $blksz" \
+	-c "pwrite -q -S 0x62 $blksz $blksz" $lowerdir/data
+mkdir -p $lowerdir/nested-lower
+$XFS_IO_PROG -f -c "pwrite -q -S 0x61 0 $blksz" \
+	-c "pwrite -q -S 0x62 $blksz $blksz" $lowerdir/nested-lower/data
+$XFS_IO_PROG -f -c "pwrite -q -S 0x62 0 $size" $basedir/src
+
+# Probe whether the base filesystem can share data.  When it can, the
+# aligned copies below share extents and verify_share checks that; when it
+# cannot, the same copies still succeed through the splice path and only
+# their data is checked.  The test is therefore not skipped on a
+# non-reflink base fs.
+base_reflink=
+$XFS_IO_PROG -f -c "pwrite -q 0 $size" $basedir/rl1 >> $seqres.full 2>&1
+if $XFS_IO_PROG -f -c "reflink $basedir/rl1 0 0 $size" $basedir/rl2 \
+	>> $seqres.full 2>&1 && [ -s $basedir/rl2 ]; then
+	base_reflink=yes
+fi
+rm -f $basedir/rl1 $basedir/rl2
+
+_scratch_mount
+
+verify_share()
+{
+	_sync_fs $basedir
+	_verify_reflink $1 $2
+}
+
+check_copy()
+{
+	local name=$1 src=$2 dst=$3 backing_src=$4 backing_dst=$5
+
+	if [ -n "$base_reflink" ]; then
+		$XFS_IO_PROG -f -c "copy_range -l $size $src" $dst \
+			>> $seqres.full 2>&1 || _fail "$name: copy failed"
+		cmp -s $src $dst || _fail "$name: data mismatch"
+		verify_share $backing_src $backing_dst
+	else
+		$XFS_IO_PROG -f -c "copy_range -s 1 -d 1 -l $copy_len $src" \
+			$dst >> $seqres.full 2>&1 || _fail "$name: copy failed"
+		_compare_range $src 1 $dst 1 $copy_len || \
+			_fail "$name: data mismatch"
+	fi
+}
+
+copy_exdev_unchanged()
+{
+	local name=$1 src=$2 dst=$3 opts=$4
+	local before after out
+
+	before="$(_md5_checksum $dst) $(stat -c "%s %f" $dst)"
+	out=$($XFS_IO_PROG -f -c "copy_range $opts $src" $dst 2>&1)
+	after="$(_md5_checksum $dst) $(stat -c "%s %f" $dst)"
+	echo "$out" | grep -q "Invalid cross-device link" || \
+		_fail "$name: expected EXDEV, got: ${out:-success}"
+	[ "$before" == "$after" ] || _fail "$name: destination was modified"
+}
+
+testio=$($XFS_IO_PROG -f \
+	-c "copy_range -s 1 -d 1 -l $copy_len $SCRATCH_MNT/data" \
+	$basedir/out1 2>&1)
+echo "$testio" | grep -q "cross-device" && \
+	_notrun "kernel does not support copy_file_range() between overlayfs and base fs"
+[ -z "$testio" ] || _fail "copy probe failed: $testio"
+_compare_range $lowerdir/data 1 $basedir/out1 1 $copy_len || \
+	_fail "out1 data mismatch"
+
+# The feature is supported; set up the extra overlay instances used below.
+# A second overlay instance backed by the same base fs.
+upperdir2=$basedir/ovl-upper2
+workdir2=$basedir/ovl-work2
+ovl2_mnt=$basedir/ovl-mnt2
+mkdir -p $upperdir2 $workdir2 $ovl2_mnt
+_overlay_mount_dirs $lowerdir $upperdir2 $workdir2 overlay2 $ovl2_mnt
+
+# A nested overlay with all layers hosted by the scratch overlay.  Its lower
+# file and newly created upper files therefore both resolve through two
+# overlay layers before reaching the base filesystem.
+nested_lower=$SCRATCH_MNT/nested-lower
+nested_upper=$SCRATCH_MNT/nested-upper
+nested_work=$SCRATCH_MNT/nested-work
+nested_upper_backing=$upperdir/nested-upper
+nested_mnt=$basedir/nested-mnt
+mkdir -p $nested_upper $nested_work $nested_mnt
+_overlay_mount_dirs $nested_lower $nested_upper $nested_work \
+	overlay-nested $nested_mnt
+
+check_copy "base fs to overlay (destination translation)" $basedir/src \
+	$SCRATCH_MNT/new3 $basedir/src $upperdir/new3
+
+check_copy "overlay to overlay, same mount" $SCRATCH_MNT/data \
+	$SCRATCH_MNT/copy9 $lowerdir/data $upperdir/copy9
+
+check_copy "overlay to second overlay instance" $SCRATCH_MNT/data \
+	$ovl2_mnt/copy10 $lowerdir/data $upperdir2/copy10
+
+check_copy "nested overlay to non-nested overlay" $nested_mnt/data \
+	$SCRATCH_MNT/from-nested $lowerdir/nested-lower/data \
+	$upperdir/from-nested
+check_copy "non-nested overlay to nested overlay" $SCRATCH_MNT/data \
+	$nested_mnt/from-overlay $lowerdir/data \
+	$nested_upper_backing/from-overlay
+
+# The splice path must synchronize source access time back to overlayfs.
+if ! findmnt -rn -T $SCRATCH_MNT -o OPTIONS | grep -qw noatime &&
+   ! findmnt -rn -T $basedir -o OPTIONS | grep -qw noatime; then
+	atime_source=$SCRATCH_MNT/atime-source
+	$XFS_IO_PROG -f -c "pwrite -q -S 0x66 0 $size" $atime_source
+	touch -a -t 200001010000 $atime_source
+	atime_before=$(stat -c %X $atime_source)
+	$XFS_IO_PROG -f -c "copy_range -s 1 -d 1 -l $copy_len $atime_source" \
+		$basedir/atime-out >> $seqres.full 2>&1 || _fail "atime copy failed"
+	[ "$(stat -c %X $atime_source)" -gt $atime_before ] || \
+		_fail "source atime was not updated"
+	_compare_range $atime_source 1 $basedir/atime-out 1 $copy_len || \
+		_fail "atime copy data mismatch"
+fi
+
+# The same alias must be found through every level of a nested source chain.
+copy_exdev_unchanged "nested backing alias" $nested_mnt/data \
+	$lowerdir/nested-lower/data \
+	"-s 0 -d $blksz -l $blksz"
+
+# The reverse direction: a plain source and an overlay destination that name
+# the same upper backing inode must also be rejected.
+$XFS_IO_PROG -f -c "pwrite -q -S 0x65 0 $size" $SCRATCH_MNT/alias15
+copy_exdev_unchanged "reverse backing alias" $upperdir/alias15 \
+	$SCRATCH_MNT/alias15 "-s 0 -d $blksz -l $blksz"
+
+# A procfs source is incompatible with the overlay's backing fs.  The copy
+# must fail with EXDEV before EOF shortening (/proc/version reports size 0)
+# turns it into a silent zero-length copy, and must not modify the target.
+echo sentinel > $SCRATCH_MNT/procver
+copy_exdev_unchanged "procfs source" /proc/version $SCRATCH_MNT/procver \
+	"-l $blksz"
+
+echo "Silence is golden"
+
+# success, all done
+_exit 0

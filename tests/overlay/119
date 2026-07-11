@@ -1,0 +1,73 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Daan De Meyer. All Rights Reserved.
+#
+# FS QA Test 119
+#
+# Verify that copy_file_range() rejects translated overlayfs endpoints whose
+# backing files are on different filesystems, without changing the target.
+#
+. ./common/preamble
+_begin_fstest auto quick copy_range nonsamefs
+
+_cleanup()
+{
+	cd /
+	$UMOUNT_PROG $SCRATCH_MNT 2>/dev/null
+	[ -n "$lowerdir" ] && rm -rf $lowerdir $srcfile $outfile
+	rm -rf $tmp.*
+}
+
+_require_test
+# Use non-default scratch underlying overlay dirs, we need to check
+# them explicitly after test.
+_require_scratch_nocheck
+_require_xfs_io_command "copy_range"
+
+# The lower layer and the plain source file live on the base test fs, the
+# upper and work dirs on the base scratch fs.
+lowerdir=$OVL_BASE_TEST_DIR/$seq-ovl-lower
+srcfile=$OVL_BASE_TEST_DIR/$seq-src
+outfile=$OVL_BASE_TEST_DIR/$seq-out
+rm -rf $lowerdir $srcfile $outfile
+mkdir $lowerdir
+$XFS_IO_PROG -f -c "pwrite -q -S 0x61 0 8k" $lowerdir/data
+$XFS_IO_PROG -f -c "pwrite -q -S 0x62 0 8k" $srcfile
+
+_scratch_mkfs >> $seqres.full 2>&1
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+workdir=$OVL_BASE_SCRATCH_MNT/$OVL_WORK
+_overlay_scratch_mount_dirs $lowerdir $upperdir $workdir
+
+copy_exdev_unchanged()
+{
+	local name=$1 src=$2 dst=$3
+	local before after out
+
+	echo sentinel > $dst
+	chmod 6777 $dst
+	before="$(_md5_checksum $dst) $(stat -c "%s %f %y" $dst)"
+	out=$($XFS_IO_PROG -f -c "copy_range -l 8k $src" $dst 2>&1)
+	after="$(_md5_checksum $dst) $(stat -c "%s %f %y" $dst)"
+	echo "$out" | grep -q "Invalid cross-device link" || \
+		_fail "$name: expected EXDEV, got: ${out:-success}"
+	[ "$before" == "$after" ] || _fail "$name: destination was modified"
+}
+
+copy_exdev_unchanged "copy from base test fs to overlay" $srcfile \
+	$SCRATCH_MNT/out1
+
+$XFS_IO_PROG -f -c "pwrite -q -S 0x63 0 8k" $SCRATCH_MNT/upperfile
+copy_exdev_unchanged "copy from overlay to base test fs" \
+	$SCRATCH_MNT/upperfile $outfile
+copy_exdev_unchanged \
+	"copy from overlay to overlay with layers on different fs" \
+	$SCRATCH_MNT/data $SCRATCH_MNT/out3
+
+# check overlayfs
+_overlay_check_scratch_dirs $lowerdir $upperdir $workdir
+
+echo "Silence is golden"
+
+# success, all done
+_exit 0

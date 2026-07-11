@@ -1,0 +1,71 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Daan De Meyer. All Rights Reserved.
+#
+# FS QA Test 121
+#
+# Verify copy_file_range() between overlayfs and its tmpfs upper layer.  These
+# copies use the terminal splice path because tmpfs does not support reflink.
+#
+. ./common/preamble
+_begin_fstest auto quick copy_range nonsamefs
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	$UMOUNT_PROG $SCRATCH_MNT 2>/dev/null
+	_clear_mount_stack
+	rm -rf $tmp.*
+}
+
+# Custom overlay layout (tmpfs upper), so skip the auto check.
+_require_scratch_nocheck
+_require_xfs_io_command "copy_range"
+_require_extra_fs tmpfs
+
+_scratch_mkfs >> $seqres.full 2>&1
+
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+
+tmpfs_mnt=$tmp.tmpfs
+mkdir -p $tmpfs_mnt
+_get_mount -t tmpfs tmpfs $tmpfs_mnt || \
+	_notrun "could not mount tmpfs fixture"
+mkdir -p $tmpfs_mnt/upper $tmpfs_mnt/work
+$XFS_IO_PROG -f -c "pwrite -q -S 0x62 0 8k" $tmpfs_mnt/plain
+
+_overlay_scratch_mount_dirs $lowerdir $tmpfs_mnt/upper $tmpfs_mnt/work
+
+# Write a file through the overlay so its data lands on the tmpfs upper layer.
+$XFS_IO_PROG -f -c "pwrite -q -S 0x64 0 8k" $SCRATCH_MNT/upperfile
+
+# A copy that must succeed; verify the copied content matches.
+check_ok()
+{
+	local name=$1 src=$2 dst=$3 out
+
+	out=$($XFS_IO_PROG -f -c "copy_range -l 8k $src" $dst 2>&1)
+	[ -z "$out" ] || _fail "$name: copy failed: $out"
+	cmp -s $src $dst || _fail "$name: content mismatch"
+}
+
+# Probe for kernel and tmpfs support with the first copy; EXDEV means the
+# matching-tmpfs terminal splice route is unavailable.
+testio=$($XFS_IO_PROG -f -c "copy_range -l 8k $SCRATCH_MNT/upperfile" \
+	$tmpfs_mnt/out1 2>&1)
+echo "$testio" | grep -q "cross-device" && \
+	_notrun "kernel does not support tmpfs backing copy_file_range()"
+[ -z "$testio" ] || _fail "tmpfs-source-splice: copy failed: $testio"
+cmp -s $SCRATCH_MNT/upperfile $tmpfs_mnt/out1 || \
+	_fail "tmpfs-source-splice: content mismatch"
+
+# Plain tmpfs source into an overlay file whose upper lands on the same tmpfs.
+check_ok "tmpfs-destination-splice" $tmpfs_mnt/plain $SCRATCH_MNT/new2
+
+_overlay_check_scratch_dirs $lowerdir $tmpfs_mnt/upper $tmpfs_mnt/work
+
+echo "Silence is golden"
+
+# success, all done
+_exit 0

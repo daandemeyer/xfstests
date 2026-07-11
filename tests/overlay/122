@@ -1,0 +1,92 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Daan De Meyer. All Rights Reserved.
+#
+# FS QA Test 122
+#
+# Verify that translated copy_file_range() operations block on a frozen
+# backing filesystem and complete after thawing it, in both directions.
+#
+. ./common/preamble
+_begin_fstest auto quick copy_range freeze samefs
+
+_cleanup()
+{
+	[ -n "$basedir" ] && xfs_freeze -u $basedir 2>/dev/null
+	[ -n "$copy_pid" ] && kill $copy_pid 2>/dev/null
+	[ -n "$copy_pid" ] && wait $copy_pid 2>/dev/null
+	cd /
+	rm -f $tmp.*
+}
+
+_require_scratch
+_require_xfs_io_command "copy_range"
+
+_scratch_mkfs >> $seqres.full 2>&1
+
+basedir=$OVL_BASE_SCRATCH_MNT
+lowerdir=$basedir/$OVL_LOWER
+
+$XFS_IO_PROG -f -c "pwrite -q -S 0x61 0 8k" $lowerdir/data
+$XFS_IO_PROG -f -c "pwrite -q -S 0x62 0 8k" $basedir/src
+copy_len=8191
+
+_scratch_mount
+
+testio=$($XFS_IO_PROG -f \
+	-c "copy_range -s 1 -d 1 -l $copy_len $SCRATCH_MNT/data" \
+	$basedir/probe 2>&1)
+echo "$testio" | grep -q "cross-device" && \
+	_notrun "kernel does not support copy_file_range() between overlayfs and base fs"
+[ -z "$testio" ] || _fail "copy probe failed: $testio"
+rm -f $basedir/probe
+
+if ! xfs_freeze -f $basedir >> $seqres.full 2>&1; then
+	_notrun "base filesystem does not support freeze"
+fi
+xfs_freeze -u $basedir >> $seqres.full 2>&1 || \
+	_fail "could not thaw base filesystem after probe"
+
+check_frozen_copy()
+{
+	local name=$1 src=$2 dst=$3
+	local i
+
+	: > $dst
+	xfs_freeze -f $basedir >> $seqres.full 2>&1 || \
+		_fail "$name: could not freeze base filesystem"
+	$XFS_IO_PROG -c "copy_range -s 1 -d 1 -l $copy_len $src" $dst \
+		>> $seqres.full 2>&1 &
+	copy_pid=$!
+	sleep 0.5
+	if ! kill -0 $copy_pid 2>/dev/null; then
+		wait $copy_pid
+		copy_pid=
+		xfs_freeze -u $basedir >> $seqres.full 2>&1
+		_fail "$name: copy did not block while frozen"
+	fi
+
+	xfs_freeze -u $basedir >> $seqres.full 2>&1 || \
+		_fail "$name: could not thaw base filesystem"
+	for i in $(seq 1 100); do
+		kill -0 $copy_pid 2>/dev/null || break
+		sleep 0.1
+	done
+	if kill -0 $copy_pid 2>/dev/null; then
+		kill $copy_pid 2>/dev/null
+		wait $copy_pid 2>/dev/null
+		copy_pid=
+		_fail "$name: copy did not complete after thaw"
+	fi
+	wait $copy_pid || _fail "$name: copy failed after thaw"
+	copy_pid=
+	cmp -s -n $copy_len -i 1:1 $src $dst || \
+		_fail "$name: copied data mismatch"
+}
+
+check_frozen_copy "translated source" $SCRATCH_MNT/data $basedir/out
+check_frozen_copy "translated destination" $basedir/src $SCRATCH_MNT/out
+
+echo "Silence is golden"
+
+_exit 0
